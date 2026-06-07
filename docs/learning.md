@@ -550,3 +550,72 @@ El documento es **un mapa vivo**. Está mejor cuanto más lo usas.
 > Esta sección la rellena Claude Code al final de cada sesión, siguiendo el formato definido en `CLAUDE.md` sección 9.6. Empieza vacía y va creciendo.
 
 <!-- Aquí Claude Code añade las entradas de cada sesión -->
+
+## 2026-06-03 — Happy path mínimo: WhatsApp → n8n → Supabase → respuesta fija
+
+### Conceptos nuevos
+
+- **Webhook trigger:** una URL que n8n genera y le das a Twilio. Cuando llega un WhatsApp, Twilio llama a esa URL con los datos del mensaje y n8n arranca el workflow. Es "push" (Twilio te avisa), no "pull" (n8n pregunta si hay mensajes).
+- **Twilio sandbox:** número de WhatsApp compartido gratuito para pruebas. Para usarlo, el móvil de prueba envía primero un mensaje de activación ("join [palabra]"). Solo acepta mensajes de teléfonos activados. No sirve para leads reales, solo para tus pruebas en semanas 1-4.
+- **Test URL vs Production URL en n8n:** cada webhook tiene dos URLs distintas. La test solo funciona cuando tienes n8n abierto esperando manualmente. La production funciona siempre que el workflow esté activo. Error clásico: pegar la test URL en Twilio y luego no entender por qué no llegan mensajes.
+- **Supabase REST API automática:** cuando creas una tabla en Supabase, automáticamente tienes un endpoint para insertar y leer filas. n8n la llama como cualquier otra API. No hace falta escribir servidor propio.
+- **Row Level Security (RLS):** seguridad por fila que Supabase activa por defecto. Sin políticas configuradas, todas las queries devuelven vacío o error silencioso. En V1 lo desactivamos para las tablas internas. Síntoma si está activo: insertas desde n8n, no hay error, pero en Supabase no aparece nada.
+- **service_role key vs anon key en Supabase:** la anon key es pública con permisos limitados. La service_role key es privada con acceso total (bypasea RLS). n8n usa la service_role key, guardada como variable de entorno en Railway, nunca en el código.
+
+### Patrones técnicos aplicados
+
+- **Webhook → Code → HTTP Request → Respond to Webhook:** los 4 nodos del workflow de hoy. Patrón base que se repetirá en todos los workflows que reciban mensajes entrantes.
+- **Variables de entorno para secretos:** las API keys de Supabase se ponen en Railway como variables de entorno (`SUPABASE_URL`, `SUPABASE_SERVICE_KEY`). n8n las lee con `$env.SUPABASE_URL`. Nunca en el JSON del workflow.
+- **TwiML como respuesta:** Twilio espera que el webhook responda con XML en formato TwiML para enviar el mensaje de vuelta al lead. n8n lo genera con el nodo "Respond to Webhook" con Content-Type text/xml.
+
+### Decisiones técnicas
+
+- **lead_id nullable en messages para V1:** el mensaje se guarda aunque el lead no exista aún en la tabla leads. Permite tener el happy path funcionando sin necesidad de crear el lead primero. Se vincula en sesión 2.
+- **RLS desactivado en V1:** una sola clínica, acceso interno. Activarlo con políticas correctas requiere más configuración. Se deja para V2 multi-clínica donde es obligatorio.
+- **Respuesta fija en lugar de modelo LLM:** el happy path de semana 1 no usa modelo. La respuesta "Hola, hemos recibido tu mensaje..." es hardcoded en el nodo TwiML. El modelo se añade en semana 3.
+
+### Sintaxis / herramientas nuevas
+
+- **Expresión n8n:** `={{ expresión }}` — la forma de usar variables dinámicas en campos de n8n. Ejemplo: `={{ $env.SUPABASE_URL }}` lee la variable de entorno. Sin el `=` al principio, n8n lo trata como texto literal.
+- **`$input.item.json['Campo']`:** en el nodo Code de n8n, así se accede a los datos que llegan del nodo anterior. `$input.item` es el dato actual, `.json` es el objeto JSON, `['From']` es el campo concreto.
+- **`gen_random_uuid()`:** función de PostgreSQL (la base de datos de Supabase) que genera un UUID automáticamente al insertar una fila. Por eso en el schema el `id` no lo ponemos nosotros, lo genera Supabase.
+- **`TIMESTAMPTZ`:** tipo de columna en PostgreSQL para fechas con zona horaria. Es el correcto para timestamps en un sistema que podría tener usuarios en distintas zonas. `DEFAULT now()` lo rellena automáticamente.
+- **`JSONB`:** tipo de columna en PostgreSQL para guardar JSON. La B significa "binary" — lo almacena optimizado para búsquedas. Usado en la tabla `events.payload` para guardar cualquier estructura sin saber de antemano qué campos tendrá.
+
+### Preguntas pendientes
+
+- ¿Cómo se valida la firma de los webhooks de Twilio? (Bloque 3 del curriculum: "firmar/validar webhooks de Twilio"). No es necesario para V1 pero es una mejora de seguridad para producción.
+- El nodo HTTP Request en n8n: ¿cuándo usar "specifyBody: json" vs "keypairs"? Quedó pendiente verificar cuál encaja mejor en la versión exacta de n8n desplegada en Railway.
+- ¿Por qué llegan vacíos `Body` y `MessageSid` de Twilio en el nodo Code? Pendiente inspeccionar el payload raw del webhook en n8n para ver los nombres exactos de campo.
+
+---
+
+## 2026-06-07 — Debug del happy path: GRANT, $env y conexión MCP
+
+### Conceptos nuevos
+
+- **GRANT en PostgreSQL:** permiso a nivel de tabla. Distinto de RLS (que es nivel de fila). Si no existe el GRANT, el rol no puede ni tocar la tabla, aunque sea `service_role` y aunque RLS esté desactivado. Crear tablas desde el SQL Editor de Supabase no añade GRANTs automáticamente — hay que hacerlo explícito.
+- **`$env` bloqueado en n8n:** n8n bloquea por defecto el acceso a variables de entorno del sistema desde los workflows, por seguridad. La alternativa correcta es usar `$vars` (Variables de n8n) o pegar los valores directamente en el nodo para V1.
+- **MCP (Model Context Protocol):** protocolo que permite a Claude conectarse directamente a herramientas externas (n8n, Supabase, etc.) y operar sobre ellas sin que el usuario tenga que hacer cambios manualmente. Se configura en `~/.claude/settings.json`.
+- **n8n API REST:** n8n expone una API propia en `/api/v1/` que permite listar, leer y modificar workflows programáticamente. Se llama con header `X-N8N-API-KEY`. Útil para debug sin tocar la UI.
+
+### Patrones técnicos aplicados
+
+- **Diagnóstico por capas:** cuando algo falla, se aísla la capa exacta haciendo la misma llamada desde distintos sitios (primero n8n, luego PowerShell directo a Supabase). Si falla en ambos, el problema es en Supabase. Si falla solo en n8n, el problema es en cómo n8n construye la llamada.
+- **JWT decode para verificar rol:** los tokens JWT de Supabase (anon key, service_role key) son decodificables y contienen el campo `role`. Se puede verificar qué key se está usando sin depender de lo que dice la UI.
+
+### Decisiones técnicas
+
+- **Credenciales pegadas directamente en el nodo (V1):** sin Variables de n8n disponibles y con $env bloqueado, la solución pragmática para V1 es pegar los valores directamente. Trade-off: si la key cambia, hay que actualizar el nodo manualmente. Aceptable para una clínica en V1.
+- **GRANT solo a service_role, no a anon:** las operaciones de backend (insertar mensajes, crear leads) deben ir por service_role. Dar acceso a anon sería inseguro para tablas internas.
+
+### Sintaxis / herramientas nuevas
+
+- **`GRANT ALL ON TABLE x TO role`:** sentencia SQL que da permisos totales a un rol sobre una tabla. Se ejecuta una vez en el SQL Editor de Supabase.
+- **`Invoke-RestMethod` en PowerShell:** equivalente a `curl` en Windows. Hace llamadas HTTP directamente desde la terminal. Útil para probar APIs sin depender de n8n.
+- **`X-N8N-API-KEY` header:** así se autentican las llamadas a la API REST de n8n. Distinto del header `Authorization` que se usa para APIs de terceros.
+
+### Preguntas pendientes
+
+- ¿Por qué llegan vacíos `Body` y `MessageSid` de Twilio? Investigar en sesión 2 inspeccionando el payload raw.
+- ¿Cómo configurar Variables de n8n (`$vars`) correctamente para no depender de credenciales hardcodeadas en los nodos?
