@@ -12,54 +12,90 @@
       "name": "Recibir WhatsApp",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [240, 300],
+      "position": [0, 0],
       "webhookId": "whatsapp-receive-webhook-id"
     },
     {
       "parameters": {
-        "jsCode": "// Twilio envía los datos del mensaje como campos de un formulario POST.\n// Extraemos los tres campos que necesitamos:\n//   From: número de quien envía, con prefijo 'whatsapp:' (ej: 'whatsapp:+34612345678')\n//   Body: texto del mensaje\n//   MessageSid: ID único que Twilio asigna a este mensaje\n\nconst from = $input.item.json['From'] || '';\nconst phone = from.replace('whatsapp:', '').trim();\nconst messageBody = $input.item.json['Body'] || '';\nconst messageSid = $input.item.json['MessageSid'] || '';\n\n// Pasamos los datos al siguiente nodo en el formato que Supabase espera\nreturn [\n  {\n    json: {\n      phone,\n      message_body: messageBody,\n      message_sid: messageSid,\n      received_at: new Date().toISOString()\n    }\n  }\n];"
+        "jsCode": "// Twilio envía los datos del mensaje como campos de un formulario POST.\n// n8n anida esos campos bajo la clave 'body' del objeto JSON.\n// Extraemos los tres campos que necesitamos:\n//   From: número de quien envía, con prefijo 'whatsapp:' (ej: 'whatsapp:+34612345678')\n//   Body: texto del mensaje\n//   MessageSid: ID único que Twilio asigna a este mensaje\n\nconst from = $input.item.json.body['From'] || '';\nconst phone = from.replace('whatsapp:', '').trim();\nconst messageBody = $input.item.json.body['Body'] || '';\nconst messageSid = $input.item.json.body['MessageSid'] || '';\n\n// Pasamos los datos al siguiente nodo en el formato que Supabase espera\nreturn [\n  {\n    json: {\n      phone,\n      message_body: messageBody,\n      message_sid: messageSid,\n      received_at: new Date().toISOString()\n    }\n  }\n];"
       },
       "id": "node-code-002",
       "name": "Parsear datos Twilio",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [460, 300]
+      "position": [224, 0]
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ $vars.SUPABASE_URL }}/rest/v1/messages",
+        "url": "SUPABASE_URL/rest/v1/leads?on_conflict=phone",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            {
-              "name": "apikey",
-              "value": "={{ $vars.SUPABASE_SERVICE_KEY }}"
-            },
-            {
-              "name": "Authorization",
-              "value": "={{ 'Bearer ' + $vars.SUPABASE_SERVICE_KEY }}"
-            },
-            {
-              "name": "Content-Type",
-              "value": "application/json"
-            },
-            {
-              "name": "Prefer",
-              "value": "return=minimal"
-            }
+            { "name": "apikey",        "value": "SUPABASE_SERVICE_KEY" },
+            { "name": "Authorization", "value": "Bearer SUPABASE_SERVICE_KEY" },
+            { "name": "Content-Type",  "value": "application/json" },
+            { "name": "Prefer",        "value": "resolution=merge-duplicates,return=representation" }
           ]
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ direction: 'inbound', body: $json.message_body, twilio_sid: $json.message_sid, created_at: $json.received_at }) }}",
+        "jsonBody": "={{ JSON.stringify({ phone: $json.phone }) }}",
+        "options": {}
+      },
+      "id": "node-upsert-lead-001",
+      "name": "Upsert lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1136, -496]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "SUPABASE_URL/rest/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey",        "value": "SUPABASE_SERVICE_KEY" },
+            { "name": "Authorization", "value": "Bearer SUPABASE_SERVICE_KEY" },
+            { "name": "Content-Type",  "value": "application/json" },
+            { "name": "Prefer",        "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ lead_id: $node[\"Upsert lead\"].json.id, direction: \"inbound\", body: $node[\"Parsear datos Twilio\"].json.message_body, twilio_sid: $node[\"Parsear datos Twilio\"].json.message_sid, created_at: $node[\"Parsear datos Twilio\"].json.received_at }) }}",
         "options": {}
       },
       "id": "node-http-003",
       "name": "Guardar mensaje en Supabase",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [680, 300]
+      "position": [1360, -496]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "SUPABASE_URL/rest/v1/events",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey",        "value": "SUPABASE_SERVICE_KEY" },
+            { "name": "Authorization", "value": "Bearer SUPABASE_SERVICE_KEY" },
+            { "name": "Content-Type",  "value": "application/json" },
+            { "name": "Prefer",        "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ type: \"message_received\", lead_id: $node[\"Upsert lead\"].json.id, payload: { phone: $node[\"Parsear datos Twilio\"].json.phone, message_body: $node[\"Parsear datos Twilio\"].json.message_body, twilio_sid: $node[\"Parsear datos Twilio\"].json.message_sid } }) }}",
+        "options": {}
+      },
+      "id": "node-log-evento-001",
+      "name": "Log evento",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1580, -496]
     },
     {
       "parameters": {
@@ -68,10 +104,7 @@
         "options": {
           "responseHeaders": {
             "entries": [
-              {
-                "name": "Content-Type",
-                "value": "text/xml"
-              }
+              { "name": "Content-Type", "value": "text/xml" }
             ]
           }
         }
@@ -80,52 +113,16 @@
       "name": "Responder a Twilio",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [900, 300]
+      "position": [1804, -496]
     }
   ],
   "connections": {
-    "Recibir WhatsApp": {
-      "main": [
-        [
-          {
-            "node": "Parsear datos Twilio",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Parsear datos Twilio": {
-      "main": [
-        [
-          {
-            "node": "Guardar mensaje en Supabase",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Guardar mensaje en Supabase": {
-      "main": [
-        [
-          {
-            "node": "Responder a Twilio",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    }
+    "Recibir WhatsApp":          { "main": [[{ "node": "Parsear datos Twilio",        "type": "main", "index": 0 }]] },
+    "Parsear datos Twilio":      { "main": [[{ "node": "Upsert lead",                 "type": "main", "index": 0 }]] },
+    "Upsert lead":               { "main": [[{ "node": "Guardar mensaje en Supabase", "type": "main", "index": 0 }]] },
+    "Guardar mensaje en Supabase":{ "main": [[{ "node": "Log evento",                 "type": "main", "index": 0 }]] },
+    "Log evento":                { "main": [[{ "node": "Responder a Twilio",          "type": "main", "index": 0 }]] }
   },
-  "active": false,
-  "settings": {
-    "executionOrder": "v1"
-  },
-  "versionId": "whatsapp-receive-v1",
-  "meta": {
-    "instanceId": "local"
-  },
-  "id": "whatsapp-receive",
-  "tags": []
+  "active": true,
+  "settings": { "executionOrder": "v1" }
 }

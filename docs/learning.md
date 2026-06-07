@@ -551,6 +551,39 @@ El documento es **un mapa vivo**. Está mejor cuanto más lo usas.
 
 <!-- Aquí Claude Code añade las entradas de cada sesión -->
 
+## 2026-06-07 — Pipeline completo: body, lead, mensaje vinculado y log de eventos
+
+### Conceptos nuevos
+
+- **Estructura anidada del webhook en n8n:** cuando Twilio llama al webhook de n8n, los campos del mensaje (Body, From, MessageSid) no llegan al nivel raíz del JSON — llegan dentro de una clave llamada `body`. En el nodo Code, la ruta correcta es `$input.item.json.body['Body']`, no `$input.item.json['Body']`. Esto es específico de n8n v2 con webhooks POST de tipo form-urlencoded.
+- **Upsert con Supabase REST API:** para hacer "inserta si no existe, devuelve el existente si ya está", Supabase necesita dos cosas juntas: (1) el header `Prefer: resolution=merge-duplicates,return=representation` y (2) el parámetro de URL `?on_conflict=phone` que le dice qué columna usar como referencia de conflicto. Sin el `?on_conflict`, Supabase no sabe dónde buscar el duplicado y falla con error de clave única.
+- **n8n desenvuelve arrays de Supabase:** cuando Supabase devuelve `[{id, phone, ...}]` (un array con un elemento), n8n lo desenvuelve automáticamente. En el siguiente nodo, `$node["Upsert lead"].json` es el objeto directamente `{id, phone, ...}`, no el array. Por eso se usa `.json.id` y no `.json[0].id`.
+- **Referencia cruzada entre nodos en n8n:** con la sintaxis `$node["NombreNodo"].json.campo` puedes acceder a los datos de cualquier nodo anterior, no solo del inmediatamente anterior. Esto permite que un nodo use datos de dos nodos distintos sin necesitar un nodo intermedio que los combine.
+- **Dos workflows con el mismo nombre:** n8n permite tener varios workflows con el mismo nombre. El activo (el que recibe webhooks reales) puede ser diferente del que aparece primero en la lista. Hay que verificar siempre cuál tiene `active: true` antes de hacer cambios.
+
+### Patrones técnicos aplicados
+
+- **Pipeline de 5 nodos para un mensaje entrante:** Recibir → Parsear → Upsert lead → Guardar mensaje → Log evento → Responder. Cada nodo tiene una responsabilidad única. Los nodos de "Guardar mensaje" y "Log evento" usan referencias cruzadas para acceder a datos de nodos anteriores sin duplicar trabajo.
+- **Debug por capas vía API:** cuando algo fallaba, usamos la API REST de n8n (`/api/v1/executions`) para ver el output exacto de cada nodo en la última ejecución, sin necesidad de abrir la UI. Permite diagnosticar en producción.
+- **Credenciales hardcodeadas para V1:** como `$env` está bloqueado para nodos añadidos vía API (pero no para los configurados manualmente), la solución pragmática en V1 es pegar los valores directamente. Anotado como deuda técnica para resolver con Variables de n8n en V2.
+
+### Decisiones técnicas
+
+- **`on_conflict=phone` en la URL del upsert:** elegido sobre otras alternativas (hacer GET primero para buscar el lead, o usar `resolution=ignore-duplicates` + GET separado) porque es la forma más directa y atómica: una sola llamada que crea o encuentra y siempre devuelve el lead con su id.
+- **`payload` como JSONB en events:** en lugar de columnas fijas (phone, message_body...), el payload es un objeto libre. Esto permite que distintos tipos de eventos tengan estructuras distintas sin cambiar el schema. `message_received` guarda phone + body + sid. Futuros eventos como `appointment_booked` guardarán otros campos.
+
+### Sintaxis / herramientas nuevas
+
+- **`$node["NombreNodo"].json.campo`:** sintaxis de n8n para referenciar datos de un nodo específico por nombre. Las comillas dobles dentro de la expresión `={{ ... }}` se escapan como `\"`.
+- **`?on_conflict=columna` en URL de Supabase:** parámetro de query que activa el comportamiento upsert de PostgREST. Sin él, `resolution=merge-duplicates` no sabe qué columna usar y falla.
+- **`Prefer: resolution=merge-duplicates,return=representation`:** header que combina dos instrucciones a Supabase: "si hay conflicto, actualiza" + "devuelve la fila completa en la respuesta".
+- **API REST de n8n para debug:** `GET /api/v1/executions?workflowId=ID&limit=1&includeData=true` devuelve la última ejecución con el output de cada nodo. Indispensable para diagnosticar en producción sin tocar la UI.
+
+### Preguntas pendientes
+
+- ¿Cómo configurar Variables de n8n (`$vars`) correctamente para no depender de credenciales hardcodeadas en los nodos? Pendiente para cuando Railway tenga las variables configuradas y n8n las exponga como `$vars`.
+- ¿Por qué `$env` funciona para nodos configurados manualmente en la UI pero no para nodos añadidos vía API? Diferencia de versión o de permisos de ejecución — no investigado en esta sesión.
+
 ## 2026-06-03 — Happy path mínimo: WhatsApp → n8n → Supabase → respuesta fija
 
 ### Conceptos nuevos
